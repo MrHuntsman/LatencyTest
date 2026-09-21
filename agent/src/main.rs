@@ -19,13 +19,18 @@ use windows::core::{Interface, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{HANDLE, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+use windows::Win32::Graphics::Direct3D::{
+    D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_FEATURE_LEVEL_11_0,
+};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Texture2D,
     ID3D11VertexShader, ID3D11PixelShader, ID3D11Resource, ID3D11RasterizerState,
-    D3D11_BIND_CONSTANT_BUFFER, D3D11_BUFFER_DESC, D3D11_CREATE_DEVICE_FLAG,
-    D3D11_CREATE_DEVICE_SINGLETHREADED, D3D11_CULL_NONE, D3D11_FILL_SOLID, D3D11_RASTERIZER_DESC,
-    D3D11_SDK_VERSION, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT, D3D11CreateDeviceAndSwapChain,
+    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_READ,
+    D3D11_CREATE_DEVICE_FLAG,
+    D3D11_CREATE_DEVICE_SINGLETHREADED, D3D11_CULL_NONE, D3D11_FILL_SOLID, D3D11_MAP_READ,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_RASTERIZER_DESC,
+    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+    D3D11_VIEWPORT, D3D11CreateDeviceAndSwapChain,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_MODE_DESC, DXGI_MODE_SCALING_UNSPECIFIED,
@@ -47,11 +52,12 @@ use windows::Win32::UI::Input::{
     RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEMOUSE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetSystemMetrics, MessageBoxW, PeekMessageW,
-    PostQuitMessage, RegisterClassW, SetWindowTextW, ShowCursor, TranslateMessage, CS_HREDRAW,
-    CS_VREDRAW, MSG, MB_ICONERROR, PM_REMOVE, RI_MOUSE_LEFT_BUTTON_DOWN, SM_CXSCREEN,
-    SM_CYSCREEN, WINDOW_EX_STYLE, WM_DESTROY, WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_QUIT,
-    WNDCLASSW, WS_CAPTION, WS_OVERLAPPED, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetSystemMetrics,
+    MessageBoxW, PeekMessageW, PostQuitMessage, RegisterClassW, SetWindowTextW, ShowCursor,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG, MB_ICONERROR, PM_REMOVE,
+    RI_MOUSE_LEFT_BUTTON_DOWN, SM_CXSCREEN, SM_CYSCREEN, WINDOW_EX_STYLE, WM_DESTROY, WM_INPUT,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_QUIT, WNDCLASSW, WS_CAPTION, WS_OVERLAPPED, WS_POPUP,
+    WS_SYSMENU, WS_VISIBLE,
 };
 
 // ---------------------------------------------------------------------------
@@ -188,7 +194,20 @@ fn register_click(now: u64) {
 
 const VS_SRC: &[u8] = b"struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };\r\nVSOut vs_main(uint vid : SV_VertexID) {\r\n    VSOut o;\r\n    float x = float((vid << 1) & 2);\r\n    float y = float(vid & 2);\r\n    o.uv = float2(x, y);\r\n    o.pos = float4(x * 2 - 1, 1 - y * 2, 0, 1);\r\n    return o;\r\n}\r\n\0";
 
-const PS_SRC: &[u8] = b"cbuffer FrameCb : register(b0) {\r\n    uint flashActive;\r\n    uint grayCode;\r\n    uint unused0;\r\n    uint unused1;\r\n};\r\n\r\nfloat4 ps_main(float2 uv : TEXCOORD0) : SV_Target {\r\n    if (uv.y >= 0.02 && uv.y <= 0.06 && uv.x >= 0.10 && uv.x <= 0.90) {\r\n        float fx = (uv.x - 0.10) / 0.80;\r\n        uint cell = (uint)(fx * 16.0);\r\n        if (cell > 15) cell = 15;\r\n        uint bit = (grayCode >> cell) & 1u;\r\n        return bit != 0u ? float4(1,1,1,1) : float4(0,0,0,1);\r\n    }\r\n    if (flashActive != 0u && uv.x >= 0.15 && uv.x <= 0.85 && uv.y >= 0.12 && uv.y <= 0.92) {\r\n        return float4(1,1,1,1);\r\n    }\r\n    return float4(0,0,0,1);\r\n}\r\n\0";
+// Region math is driven by SV_POSITION (pixel coordinates) rather than an
+// interpolated TEXCOORD, so it does not depend on attribute interpolation.
+const PS_SRC: &[u8] = b"cbuffer FrameCb : register(b0) {\r\n    uint flashActive;\r\n    uint grayCode;\r\n    float2 screenSize;\r\n};\r\n\r\nfloat4 ps_main(float4 pos : SV_POSITION) : SV_Target {\r\n    float2 uv = pos.xy / screenSize;\r\n    if (uv.y >= 0.02 && uv.y <= 0.06 && uv.x >= 0.10 && uv.x <= 0.90) {\r\n        float fx = (uv.x - 0.10) / 0.80;\r\n        uint cell = (uint)(fx * 16.0);\r\n        if (cell > 15) cell = 15;\r\n        uint bit = (grayCode >> cell) & 1u;\r\n        return bit != 0u ? float4(1,1,1,1) : float4(0,0,0,1);\r\n    }\r\n    if (flashActive != 0u && uv.x >= 0.15 && uv.x <= 0.85 && uv.y >= 0.12 && uv.y <= 0.92) {\r\n        return float4(1,1,1,1);\r\n    }\r\n    return float4(0,0,0,1);\r\n}\r\n\0";
+
+/// Diagnostic shader: ignores the constant buffer and returns white for every
+/// fragment. Used by --selftest to distinguish "geometry not rasterizing" from
+/// "constant buffer not reaching the shader".
+const PS_WHITE_SRC: &[u8] =
+    b"float4 ps_main(float4 pos : SV_POSITION) : SV_Target { return float4(1,1,1,1); }\r\n\0";
+
+/// Diagnostic shader: R = uv.x, G = uv.y, B = constant-buffer flag.
+/// Sampling a grid of points shows whether uv spans the viewport correctly
+/// and whether the cbuffer reached the shader.
+const PS_DIAG_SRC: &[u8] = b"cbuffer FrameCb : register(b0) {\r\n    uint flashActive;\r\n    uint grayCode;\r\n    float2 screenSize;\r\n};\r\n\r\nfloat4 ps_main(float4 pos : SV_POSITION) : SV_Target {\r\n    float2 uv = pos.xy / screenSize;\r\n    float flag = (flashActive != 0u) ? 1.0 : 0.0;\r\n    return float4(uv.x, uv.y, flag, 1.0);\r\n}\r\n\0";
 
 fn pc(b: &[u8]) -> PCSTR {
     PCSTR(b.as_ptr())
@@ -201,14 +220,20 @@ fn pc(b: &[u8]) -> PCSTR {
 struct FrameCb {
     flash_active: u32,
     gray_code: u32,
-    _pad: [u32; 2],
+    screen_w: f32,
+    screen_h: f32,
 }
 
 struct Renderer {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     swap_chain: IDXGISwapChain,
+    width: f32,
+    height: f32,
     cb: ID3D11Buffer,
+    ps_scene: ID3D11PixelShader,
+    ps_white: ID3D11PixelShader,
+    ps_diag: ID3D11PixelShader,
     tearing: bool,
 }
 
@@ -317,8 +342,49 @@ unsafe fn create_renderer(hwnd: HWND, width: u32, height: u32, allow_tearing: bo
     device.CreatePixelShader(ps_bytes, None, Some(&mut ps))?;
     let ps = ps.unwrap();
 
+    let mut white_blob = None;
+    D3DCompile(
+        PS_WHITE_SRC.as_ptr() as *const core::ffi::c_void,
+        PS_WHITE_SRC.len() - 1,
+        None,
+        None,
+        None,
+        pc(b"ps_main\0"),
+        pc(b"ps_5_0\0"),
+        0,
+        0,
+        &mut white_blob,
+        None,
+    )?;
+    let white_blob = white_blob.unwrap();
+    let white_bytes = std::slice::from_raw_parts(white_blob.GetBufferPointer() as *const u8, white_blob.GetBufferSize());
+    let mut ps_white: Option<ID3D11PixelShader> = None;
+    device.CreatePixelShader(white_bytes, None, Some(&mut ps_white))?;
+    let ps_white = ps_white.unwrap();
+
+    let mut diag_blob = None;
+    D3DCompile(
+        PS_DIAG_SRC.as_ptr() as *const core::ffi::c_void,
+        PS_DIAG_SRC.len() - 1,
+        None,
+        None,
+        None,
+        pc(b"ps_main\0"),
+        pc(b"ps_5_0\0"),
+        0,
+        0,
+        &mut diag_blob,
+        None,
+    )?;
+    let diag_blob = diag_blob.unwrap();
+    let diag_bytes = std::slice::from_raw_parts(diag_blob.GetBufferPointer() as *const u8, diag_blob.GetBufferSize());
+    let mut ps_diag: Option<ID3D11PixelShader> = None;
+    device.CreatePixelShader(diag_bytes, None, Some(&mut ps_diag))?;
+    let ps_diag = ps_diag.unwrap();
+
     context.VSSetShader(&vs, None);
     context.PSSetShader(&ps, None);
+    context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     // Rasterizer: cull none so the fullscreen triangle always draws.
     let rs_desc = D3D11_RASTERIZER_DESC {
@@ -348,7 +414,18 @@ unsafe fn create_renderer(hwnd: HWND, width: u32, height: u32, allow_tearing: bo
     };
     context.RSSetViewports(Some(&[vp]));
 
-    Ok(Renderer { device, context, swap_chain, cb, tearing: allow_tearing })
+    Ok(Renderer {
+        device,
+        context,
+        swap_chain,
+        width: width as f32,
+        height: height as f32,
+        cb,
+        ps_scene: ps,
+        ps_white,
+        ps_diag,
+        tearing: allow_tearing,
+    })
 }
 
 impl Renderer {
@@ -361,18 +438,8 @@ impl Renderer {
         let mut rtv: Option<ID3D11RenderTargetView> = None;
         self.device.CreateRenderTargetView(&resource, None, Some(&mut rtv))?;
         let rtv = rtv.unwrap();
-        self.context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
 
-        // Explicit black clear — never present an uninitialized backbuffer.
-        let clear = [0.0f32, 0.0, 0.0, 1.0];
-        self.context.ClearRenderTargetView(&rtv, &clear);
-
-        let cb_data = FrameCb { flash_active: flash_active as u32, gray_code, _pad: [0; 2] };
-        let cb_res: ID3D11Resource = self.cb.cast()?;
-        self.context.UpdateSubresource(&cb_res, 0, None, &cb_data as *const _ as *const core::ffi::c_void, 0, 0);
-        let cbs: [Option<ID3D11Buffer>; 1] = [Some(self.cb.clone())];
-        self.context.PSSetConstantBuffers(0, Some(&cbs));
-        self.context.Draw(3, 0);
+        self.draw_scene(&rtv, flash_active, gray_code);
 
         let mut sync = 1u32;
         let mut present_flags = DXGI_PRESENT(0);
@@ -382,6 +449,151 @@ impl Renderer {
         }
         self.swap_chain.Present(sync, present_flags).ok()?;
         Ok(())
+    }
+}
+
+impl Renderer {
+    /// Draw the scene into a given render target.
+    unsafe fn draw_scene(&self, rtv: &ID3D11RenderTargetView, flash_active: bool, gray_code: u32) {
+        self.context.PSSetShader(&self.ps_scene, None);
+        let clear = [0.0f32, 0.0, 0.0, 1.0];
+        self.context.ClearRenderTargetView(rtv, &clear);
+        self.context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+
+        let cb_data = FrameCb {
+            flash_active: flash_active as u32,
+            gray_code,
+            screen_w: self.width,
+            screen_h: self.height,
+        };
+        if let Ok(cb_res) = self.cb.cast::<ID3D11Resource>() {
+            self.context.UpdateSubresource(&cb_res, 0, None, &cb_data as *const _ as *const core::ffi::c_void, 0, 0);
+            let cbs: [Option<ID3D11Buffer>; 1] = [Some(self.cb.clone())];
+            self.context.PSSetConstantBuffers(0, Some(&cbs));
+        }
+        self.context.Draw(3, 0);
+    }
+
+    /// Renders the scene into an offscreen texture and reads pixels back.
+    /// Independent of the swapchain (a post-Present back buffer is discarded,
+    /// so reading it back would prove nothing). Used by --selftest.
+    unsafe fn selftest_readback(&self, width: u32, height: u32) -> windows::core::Result<String> {
+        let color_desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut offscreen: Option<ID3D11Texture2D> = None;
+        self.device.CreateTexture2D(&color_desc, None, Some(&mut offscreen))?;
+        let offscreen = offscreen.unwrap();
+        let offscreen_res: ID3D11Resource = offscreen.cast()?;
+        let mut rtv: Option<ID3D11RenderTargetView> = None;
+        self.device.CreateRenderTargetView(&offscreen_res, None, Some(&mut rtv))?;
+        let rtv = rtv.unwrap();
+
+        // Pass 1: unconditional white shader — tests geometry/rasterization
+        // and the readback path with no constant-buffer involvement.
+        self.context.PSSetShader(&self.ps_white, None);
+        let clear = [0.0f32, 0.0, 0.0, 1.0];
+        self.context.ClearRenderTargetView(&rtv, &clear);
+        self.context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+        self.context.Draw(3, 0);
+
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut staging: Option<ID3D11Texture2D> = None;
+        self.device.CreateTexture2D(&desc, None, Some(&mut staging))?;
+        let staging = staging.unwrap();
+        let dst: ID3D11Resource = staging.cast()?;
+
+        let copy_and_map = |this: &Renderer| -> windows::core::Result<D3D11_MAPPED_SUBRESOURCE> {
+            this.context.CopyResource(&dst, &offscreen_res);
+            let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+            this.context.Map(&dst, 0, D3D11_MAP_READ, 0, Some(&mut m))?;
+            Ok(m)
+        };
+        // Texture format is DXGI_FORMAT_R8G8B8A8_UNORM, so bytes are R,G,B,A.
+        let sample_at = |m: &D3D11_MAPPED_SUBRESOURCE, fx: f32, fy: f32| -> (u8, u8, u8) {
+            let x = ((width as f32 * fx) as usize).min(width as usize - 1);
+            let y = ((height as f32 * fy) as usize).min(height as usize - 1);
+            let row = (m.pData as *const u8).add(y * m.RowPitch as usize);
+            let px = row.add(x * 4);
+            (*px, *px.add(1), *px.add(2)) // (r, g, b)
+        };
+
+        // Sample pass 1 (white shader)
+        let m1 = copy_and_map(self)?;
+        let white_shader_center = sample_at(&m1, 0.5, 0.5);
+        let row_pitch = m1.RowPitch;
+        self.context.Unmap(&dst, 0);
+
+        // Pass 1b: diagnostic shader with the constant buffer bound.
+        self.context.PSSetShader(&self.ps_diag, None);
+        self.context.ClearRenderTargetView(&rtv, &clear);
+        self.context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+        let cb_data = FrameCb { flash_active: 1, gray_code: 0, screen_w: width as f32, screen_h: height as f32 };
+        let cb_res: ID3D11Resource = self.cb.cast()?;
+        self.context.UpdateSubresource(&cb_res, 0, None, &cb_data as *const _ as *const core::ffi::c_void, 0, 0);
+        let cbs: [Option<ID3D11Buffer>; 1] = [Some(self.cb.clone())];
+        self.context.PSSetConstantBuffers(0, Some(&cbs));
+        self.context.Draw(3, 0);
+        let m1b = copy_and_map(self)?;
+        let diag_grid: Vec<String> = [(0.1f32, 0.1f32), (0.25, 0.25), (0.5, 0.5), (0.75, 0.75), (0.9, 0.9)]
+            .iter()
+            .map(|(fx, fy)| format!("({:.0},{:.0})={:?}", fx, fy, sample_at(&m1b, *fx, *fy)))
+            .collect();
+        self.context.Unmap(&dst, 0);
+
+        // Pass 2: the real scene shader with flash lit and alternating cells
+        self.draw_scene(&rtv, true, 0xAAAA);
+        let m2 = copy_and_map(self)?;
+        let flash = sample_at(&m2, 0.5, 0.5);   // inside flash rect -> white
+        let dark = sample_at(&m2, 0.02, 0.5);   // left margin -> black
+        let bar0 = sample_at(&m2, 0.12, 0.04);  // cell 0: bit0 of 0xAAAA = 0 -> black
+        let bar1 = sample_at(&m2, 0.17, 0.04);  // cell 1: bit1 = 1 -> white
+        let bar3 = sample_at(&m2, 0.27, 0.04);  // cell 3: bit3 = 1 -> white
+        self.context.Unmap(&dst, 0);
+
+        let verdict = |p: (u8, u8, u8), want_white: bool| {
+            let is_white = p.0 > 200 && p.1 > 200 && p.2 > 200;
+            if is_white == want_white { "ok" } else { "MISMATCH" }
+        };
+
+        Ok(format!(
+            "offscreen {}x{}  rowPitch {}\n\
+             [pass1 white-shader] center = {:?}  (want white)\n\
+             [pass1b diag uv grid] R=uv.x G=uv.y B=cbflag\n    {}\n\
+             [pass2 scene]  flash(0.50,0.50) = {:?}  want white  {}\n\
+             [pass2 scene]  dark(0.02,0.50)  = {:?}  want black  {}\n\
+             [pass2 scene]  barcode cell0    = {:?}  want black  {}\n\
+             [pass2 scene]  barcode cell1    = {:?}  want white  {}\n\
+             [pass2 scene]  barcode cell3    = {:?}  want white  {}\n",
+            width, height, row_pitch,
+            white_shader_center,
+            diag_grid.join("\n    "),
+            flash, verdict(flash, true),
+            dark, verdict(dark, false),
+            bar0, verdict(bar0, false),
+            bar1, verdict(bar1, true),
+            bar3, verdict(bar3, true),
+        ))
     }
 }
 
@@ -502,7 +714,27 @@ unsafe fn run() -> windows::core::Result<()> {
     let hwnd = create_window(w, h, fullscreen)?;
     register_raw_input(hwnd)?;
 
-    let renderer = create_renderer(hwnd, w as u32, h as u32, tearing)?;
+    // Match the swapchain to the actual client area. A mismatch between
+    // swapchain size and client rect is a common source of nothing-showing.
+    let mut rect = windows::Win32::Foundation::RECT::default();
+    let _ = GetClientRect(hwnd, &mut rect);
+    let (cw, ch) = if fullscreen {
+        (w as u32, h as u32)
+    } else {
+        ((rect.right - rect.left) as u32, (rect.bottom - rect.top) as u32)
+    };
+    println!("client area: {cw}x{ch}");
+
+    let renderer = create_renderer(hwnd, cw, ch, tearing)?;
+
+    if std::env::args().any(|a| a == "--selftest") {
+        let report = renderer.selftest_readback(cw, ch)?;
+        std::fs::write("selftest.txt", &report).ok();
+        println!("{report}");
+        let wide: Vec<u16> = format!("selftest written to selftest.txt\n\n{report}").encode_utf16().chain([0]).collect();
+        let _ = MessageBoxW(None, PCWSTR(wide.as_ptr()), windows::core::w!("latency-agent selftest"), MB_ICONERROR);
+        return Ok(());
+    }
 
     // Flip-model waitable-object pacing (spec §3.2)
     let sc2: IDXGISwapChain2 = renderer.swap_chain.cast()?;

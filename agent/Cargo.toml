@@ -1,0 +1,28 @@
+[package]
+name = "latency-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Click-to-photon PC emitter: raw input, D3D11 flip swapchain, frame accounting"
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_Media",
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -8,6 +8,7 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
 import android.media.Image
 import android.media.ImageReader
@@ -72,8 +73,16 @@ class CameraSensor(
     var exposureNs: Long = CameraSelection.DEFAULT_EXPOSURE_NS
     var sensitivity: Int = CameraSelection.DEFAULT_SENSITIVITY
     var captureSize: Size = Size(1280, 720)
-    var rollingShutterSkewNs: Long? =
-        characteristics.get(CameraCharacteristics.SENSOR_ROLLING_SHUTTER_SKEW)
+
+    /**
+     * Rolling-shutter skew, in nanoseconds, from the latest frame's metadata.
+     *
+     * SENSOR_ROLLING_SHUTTER_SKEW is a CaptureResult key (per-frame), not a
+     * CameraCharacteristics key, so it is read per frame rather than once.
+     * If the HAL omits it, §4.5 says to self-calibrate S from the barcode
+     * spacing instead - that path is milestone 3.
+     */
+    @Volatile var rollingShutterSkewNs: Long? = null
 
     // Frame health counters surfaced in the UI. @Volatile: written on the
     // analysis thread, read from the UI thread.
@@ -88,6 +97,7 @@ class CameraSensor(
     var logFile: File? = null; private set
 
     private var lastFpsStamp = System.nanoTime()
+    private var analysisFrameIndex: Long = 0
 
     fun start(previewSurface: Surface) {
         this.previewSurface = previewSurface
@@ -227,6 +237,7 @@ class CameraSensor(
             val ts = image.timestamp
             val result = synchronized(metadataLock) { metadata.remove(ts) }
             if (result == null) framesDropped++
+            result?.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW)?.let { rollingShutterSkewNs = it }
 
             val flash = YPlaneAnalyzer.roiStats(
                 image, RoiSpec.FLASH_X0, RoiSpec.FLASH_Y0, RoiSpec.FLASH_X1, RoiSpec.FLASH_Y1
@@ -234,9 +245,12 @@ class CameraSensor(
             val cells = YPlaneAnalyzer.barcodeCells(image)
             val index = YPlaneAnalyzer.grayToBinary(cells)
 
+            // SENSOR_FRAME_NUMBER is a hidden key, so the analysed-frame counter
+            // is used for indexing; SENSOR_TIMESTAMP is the real frame identity
+            // (it is what the PC-side log pairs against).
             val sample = FrameSample(
                 sensorTimestampNs = ts,
-                frameNumber = result?.get(CaptureResult.SENSOR_FRAME_NUMBER) ?: -1L,
+                frameNumber = analysisFrameIndex++,
                 exposureNs = result?.get(CaptureResult.SENSOR_EXPOSURE_TIME),
                 sensitivity = result?.get(CaptureResult.SENSOR_SENSITIVITY),
                 flashMean = flash.mean,

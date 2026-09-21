@@ -73,10 +73,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         preview.holder.addCallback(this)
 
         // Preview + overlay stacked in a 16:9 box
-        val previewBox = android.widget.FrameLayout(this).apply {
-            addView(preview, android.widget.FrameLayout.LayoutParams(-1, -1))
-            addView(overlay, android.widget.FrameLayout.LayoutParams(-1, -1))
-        }
+        val previewBox = android.widget.FrameLayout(this)
+        val matchParent = android.widget.FrameLayout.LayoutParams(
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+        )
+        previewBox.addView(preview, matchParent)
+        previewBox.addView(overlay, android.widget.FrameLayout.LayoutParams(matchParent))
 
         statusView = TextView(this).apply {
             text = "Requesting camera permission…"

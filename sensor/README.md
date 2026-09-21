@@ -14,16 +14,31 @@ Milestone status (SPEC.md §8):
 ## Build
 
 Needs JDK 17 + Android SDK (platform 34, build-tools). Either open the folder in
-Android Studio (**File → Open → `sensor/`**, let it sync and generate the Gradle
-wrapper) or from the command line, if Gradle is on PATH:
+Android Studio (**File → Open → `sensor/`**) or build from the command line:
 
 ```bash
 cd sensor
-gradle wrapper            # once, if gradlew is missing
 ./gradlew assembleDebug
 ```
 
 The resulting APK lands in `sensor/app/build/outputs/apk/debug/app-debug.apk`.
+
+### Toolchain used for the verified build
+
+A portable, admin-free toolchain lives in `~/latency-tools` (outside the repo):
+Temurin JDK 17, Android command-line tools + platform 34/build-tools 34.0.0,
+and Gradle 8.7. `sensor/local.properties` points at that SDK and is gitignored,
+so set your own `sdk.dir` if you build with Android Studio's SDK instead.
+
+```bash
+export JAVA_HOME="$HOME/latency-tools/jdk-17.0.20.1+1"
+export PATH="$JAVA_HOME/bin:$PATH"
+cd sensor && ./gradlew assembleDebug
+```
+
+Note: `sdk.dir` in `local.properties` must use forward slashes on Windows; a
+backslash-escaped path makes Gradle fail with a "filename or volume label
+syntax is incorrect" error.
 
 ## Install and run
 

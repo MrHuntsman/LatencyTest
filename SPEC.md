@@ -92,6 +92,15 @@ INFO_SUPPORTED_HARDWARE_LEVEL ≥ FULL
 REQUEST_AVAILABLE_CAPABILITIES contains MANUAL_SENSOR and READ_SENSOR_SETTINGS
 SENSOR_INFO_TIMESTAMP_SOURCE — branch on the result (§4.4)
 
+Implementation note (verified against the public SDK, android-34):
+SENSOR_ROLLING_SHUTTER_SKEW is a **CaptureResult** (per-frame) key, not a
+CameraCharacteristics key, so it is read from each frame's metadata rather than
+checked once at startup, and the HAL may omit it entirely — hence the barcode
+self-calibration path in §4.5 is a primary path, not just a cross-check.
+Two other keys often assumed public are hidden and must be avoided:
+LENS_INFO_AVAILABLE_FOCUS_DISTANCES (use LENS_INFO_MINIMUM_FOCUS_DISTANCE) and
+SENSOR_FRAME_NUMBER (use SENSOR_TIMESTAMP as the frame identity).
+
 4.2 Capture configuration
 Everything automatic must be off; auto-exposure drift is what makes the browser version unreliable.
 

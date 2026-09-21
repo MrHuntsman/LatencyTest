@@ -36,7 +36,8 @@ object CameraSelection {
         val rollingShutterSkewNs: Long?,
         val hasManualSensor: Boolean,
         val hasReadSensorSettings: Boolean,
-        val focusRangeDiopters: FloatArray?,
+        /** LENS_INFO_MINIMUM_FOCUS_DISTANCE: closest focus distance in dioptres. */
+        val minimumFocusDistance: Float?,
     ) {
         val sensorArea: Float
             get() = physicalSize?.let { it.width * it.height } ?: 0f
@@ -77,14 +78,14 @@ object CameraSelection {
                         ?: CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_UNKNOWN,
                     exposureRange = c.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE),
                     sensitivityRange = c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE),
-                    rollingShutterSkewNs = c.get(CameraCharacteristics.SENSOR_ROLLING_SHUTTER_SKEW),
+                    rollingShutterSkewNs = null, // CaptureResult key: read per frame
                     hasManualSensor = caps.contains(
                         CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR
                     ),
                     hasReadSensorSettings = caps.contains(
                         CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_READ_SENSOR_SETTINGS
                     ),
-                    focusRangeDiopters = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCUS_DISTANCES),
+                    minimumFocusDistance = c.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE),
                 )
             )
         }
@@ -138,8 +139,11 @@ object CameraSelection {
                 problems += "sensitivity $requiredSensitivity outside sensor range ${r.lower}..${r.upper}"
             }
         } ?: problems.add("no SENSOR_INFO_SENSITIVITY_RANGE")
-        if (c.rollingShutterSkewNs == null) {
-            problems += "SENSOR_ROLLING_SHUTTER_SKEW unavailable (will self-calibrate from barcode, §4.5)"
+        // SENSOR_ROLLING_SHUTTER_SKEW is per-frame CaptureResult metadata; whether
+        // the HAL populates it can only be confirmed at runtime. §4.5 covers the
+        // fallback: self-calibrate the skew from barcode spacing within a frame.
+        if (c.minimumFocusDistance == null) {
+            problems += "LENS_INFO_MINIMUM_FOCUS_DISTANCE unavailable (manual focus may be coarse)"
         }
         return problems
     }

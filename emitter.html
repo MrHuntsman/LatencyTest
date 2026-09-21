@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Emitter — System Latency Test</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="flashLayer"></div>
+  <div id="emitterHud">
+    <strong>⚡ Emitter</strong>
+    <span>Click or press any key to flash</span>
+    <span class="spacer"></span>
+    <span id="paintStat">click→paint: —</span>
+    <a href="#" id="fsBtn">Fullscreen</a>
+    <a href="#" id="exitFs" hidden>Exit fullscreen</a>
+    <a href="index.html">Home</a>
+  </div>
+
+  <script>
+  (function () {
+    'use strict';
+
+    var flashLayer = document.getElementById('flashLayer');
+    var paintStat = document.getElementById('paintStat');
+    var fsBtn = document.getElementById('fsBtn');
+    var exitBtn = document.getElementById('exitFs');
+
+    var flashUntil = 0;
+    var lastPaintMs = null;
+
+    function requestFlash() {
+      var now = performance.now();
+      // Ignore repeats while a flash is already scheduled/active (~1 Hz pacing).
+      if (now < flashUntil) return;
+      var eventTime = now; // closest we can get to the click's dispatch time
+      flashUntil = now + 90;
+      flashLayer.classList.add('white');
+
+      // Confirm the flash actually reached the screen on the next frame.
+      requestAnimationFrame(function () {
+        var paintTime = performance.now();
+        lastPaintMs = paintTime - eventTime;
+        paintStat.textContent = 'click→paint: ' + lastPaintMs.toFixed(1) + ' ms';
+      });
+
+      setTimeout(function () {
+        flashLayer.classList.remove('white');
+      }, 90);
+    }
+
+    window.addEventListener('mousedown', requestFlash, { passive: true });
+    window.addEventListener('keydown', requestFlash);
+
+    fsBtn.addEventListener('click', function (e) {
+      e.preventDefault();
+      var el = document.documentElement;
+      if (el.requestFullscreen) el.requestFullscreen().catch(function () {});
+    });
+    exitBtn.addEventListener('click', function (e) {
+      e.preventDefault();
+      if (document.exitFullscreen) document.exitFullscreen().catch(function () {});
+    });
+    document.addEventListener('fullscreenchange', function () {
+      var fs = !!document.fullscreenElement;
+      fsBtn.hidden = fs;
+      exitBtn.hidden = !fs;
+    });
+  })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>Sensor — System Latency Test</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="sensor-wrap">
+    <header>
+      <h1>📱 Sensor</h1>
+      <p>Point the camera at the PC's screen and place the phone within ~30&nbsp;cm of the mouse.</p>
+    </header>
+
+    <div class="cam-box" id="camBox">
+      <video id="cam" playsinline muted></video>
+      <canvas id="overlay"></canvas>
+      <div class="target-guide" id="targetGuide">
+        <div class="box">Fill this box with the monitor</div>
+      </div>
+    </div>
+    <div class="lum-meter"><div id="lumBar"></div></div>
+    <div class="meter-label">
+      <span id="lumValue">luminance: —</span>
+      <span id="audioMeter">mic: idle</span>
+    </div>
+
+    <div class="controls">
+      <button class="primary" id="startBtn">Start</button>
+      <button id="calBtn" disabled>Calibrate mic</button>
+      <button id="resetBtn" disabled>Reset</button>
+    </div>
+
+    <div class="status" id="status">Grant camera + microphone access, fill the dashed box with the monitor, then Start.</div>
+
+    <div class="results">
+      <div class="stat big">
+        <div class="value" id="resMedian">—</div>
+        <div class="label">Median (ms)</div>
+      </div>
+      <div class="stat uncertain">
+        <div class="value" id="resUnc">—</div>
+        <div class="label">± Uncertainty</div>
+      </div>
+      <div class="stat">
+        <div class="value" id="resPairs">0</div>
+        <div class="label">Pairs</div>
+      </div>
+    </div>
+    <p class="verdict" id="verdict"></p>
+
+    <div class="pairs" id="pairsSection" hidden>
+      <h3>Measured pairs</h3>
+      <table>
+        <thead><tr><th>#</th><th>Flash ms</th><th>Pairs</th></tr></thead>
+        <tbody id="pairsBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+  (function () {
+    'use strict';
+
+    // ---------- DOM ----------
+    var $ = function (id) { return document.getElementById(id); };
+    var video = $('cam'), overlay = $('overlay'), camBox = $('camBox');
+    var targetGuide = $('targetGuide'), lumBar = $('lumBar'), lumValue = $('lumValue');
+    var audioMeterEl = $('audioMeter'), statusEl = $('status');
+    var startBtn = $('startBtn'), calBtn = $('calBtn'), resetBtn = $('resetBtn');
+    var resMedian = $('resMedian'), resUnc = $('resUnc'), resPairs = $('resPairs');
+    var verdictEl = $('verdict'), pairsSection = $('pairsSection'), pairsBody = $('pairsBody');
+
+    // ---------- tunables ----------
+    var LUM_JUMP = 40;        // required luminance rise for a flash (0-255)
+    var PAIR_WINDOW = 400;    // max ms between a click and its flash
+    var QUIET_AFTER_PAIR = 500; // ignore events right after pairing (double-click / echo)
+    var MIN_AUDIO_LEVEL = 0.02; // threshold for mic transient, in RMS
+    var FLASH_DEBOUNCE = 120; // ignore further flash edges within this window
+    var CAL_BEEP_MS = 180;    // per-beep duration
+    var target = { x: 0, y: 0, w: 0, h: 0 };
+
+    // ---------- state ----------
+    var stream = null, audioCtx = null, analyser = null, srcNode = null;
+    var workletNode = null, oscGain = null;
+    var running = false;
+    var clickEvents = [];      // audio click timestamps (performance.now)
+    var pairs = [];            // { ms } latencies
+    var lastFlashAt = -1e9;
+    var quietUntil = 0;        // ignore events right after a successful pair
+    var micOffsetMs = null;    // calibration result
+
+    function setStatus(msg, cls) {
+      statusEl.textContent = msg;
+      statusEl.className = 'status' + (cls ? ' ' + cls : '');
+    }
+
+    // ================= AUDIO =================
+    async function initAudio() {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+      srcNode = audioCtx.createMediaStreamSource(stream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      srcNode.connect(analyser);
+
+      // AudioWorklet for low-latency onset detection (falls back to polling).
+      try {
+        var blob = new Blob([AUDIO_WORKLET_SRC], { type: 'application/javascript' });
+        var url = URL.createObjectURL(blob);
+        await audioCtx.audioWorklet.addModule(url);
+        workletNode = new AudioWorkletNode(audioCtx, 'onset-detector');
+        workletNode.port.onmessage = function (e) {
+          if (e.data.type === 'click' && running) {
+            clickEvents.push({ t: performance.now(), rms: e.data.rms });
+            if (clickEvents.length > 40) clickEvents.shift();
+            audioMeterEl.textContent = 'mic: click! (' + e.data.rms.toFixed(3) + ')';
+          } else if (e.data.type === 'level') {
+            audioMeterEl.textContent = 'mic: ' + e.data.level.toFixed(3);
+          }
+        };
+        srcNode.connect(workletNode);
+      } catch (err) {
+        console.warn('AudioWorklet unavailable, falling back to analyser polling', err);
+      }
+    }
+
+    var AUDIO_WORKLET_SRC = [
+      'class OnsetDetector extends AudioWorkletProcessor {',
+      '  constructor() {',
+      '    super();',
+      '    this.env = 0;',
+      '    this.armed = true;',
+      '    this.sampleRate_ = sampleRate;',
+      '  }',
+      '  process(inputs) {',
+      '    var input = inputs[0];',
+      '    if (!input || !input[0]) return true;',
+      '    var ch = input[0];',
+      '    var sum = 0;',
+      '    for (var i = 0; i < ch.length; i++) sum += ch[i] * ch[i];',
+      '    var rms = Math.sqrt(sum / ch.length);',
+      '    // fast-attack envelope follower',
+      '    this.env = rms > this.env ? rms : this.env * 0.85;',
+      '    this.port.postMessage({ type: "level", level: this.env });',
+      '    if (this.env > 0.02 && this.armed) {',
+    '      this.armed = false;',
+    '      this.port.postMessage({ type: "click", rms: +this.env.toFixed(4), t: currentTime });',
+    '    }',
+    '    if (this.env < 0.01) this.armed = true;',
+    '    // throttle level meter to ~10 msgs/sec',
+    '    this.blockCount = (this.blockCount || 0) + 1;',
+    '    if (this.blockCount % 32 === 0) this.port.postMessage({ type: "level", level: +this.env.toFixed(4) });',
+      '    return true;',
+      '  }',
+      '}',
+      'registerProcessor("onset-detector", OnsetDetector);'
+    ].join('\n');
+
+    async function calibrate() {
+      if (!audioCtx) return;
+      setStatus('Calibrating: 3 beeps. Keep the room quiet…', 'warn');
+      calBtn.disabled = true;
+      var samples = [];
+      for (var i = 0; i < 3; i++) {
+        var t0 = await playBeep();
+        var heard = await waitForClick(1500);
+        if (heard == null) {
+          setStatus('Calibration failed — beep not heard. Raise the volume and retry.', 'err');
+          calBtn.disabled = false;
+          return;
+        }
+        samples.push(heard - t0);
+        await sleep(350);
+      }
+      micOffsetMs = median(samples);
+      setStatus('Mic calibrated: capture offset ' + micOffsetMs.toFixed(1) + ' ms (subtracted from every pair).', 'ok');
+      calBtn.disabled = false;
+    }
+
+    function playBeep() {
+      return new Promise(function (resolve) {
+        oscGain = audioCtx.createGain();
+        oscGain.gain.value = 0.25;
+        oscGain.connect(audioCtx.destination);
+        var osc = audioCtx.createOscillator();
+        osc.frequency.value = 880;
+        osc.connect(oscGain);
+        var t0 = audioCtx.currentTime;
+        osc.start(t0);
+        osc.stop(t0 + CAL_BEEP_MS / 1000);
+        oscGain.gain.setValueAtTime(0.25, t0 + CAL_BEEP_MS / 1000 - 0.02);
+        oscGain.gain.linearRampToValueAtTime(0, t0 + CAL_BEEP_MS / 1000);
+        setTimeout(function () { resolve(performance.now()); }, CAL_BEEP_MS + 30);
+        oscGain = null;
+      });
+    }
+
+    function waitForClick(timeoutMs) {
+      return new Promise(function (resolve) {
+        var startLen = clickEvents.length;
+        var t0 = performance.now();
+        (function poll() {
+          if (clickEvents.length > startLen) return resolve(clickEvents[clickEvents.length - 1].t);
+          if (performance.now() - t0 > timeoutMs) return resolve(null);
+          setTimeout(poll, 20);
+        })();
+      });
+    }
+
+    // ================= CAMERA =================
+    function computeTarget() {
+      var vw = video.videoWidth, vh = video.videoHeight;
+      target.w = vw * 0.46; target.h = vh * 0.46;
+      target.x = (vw - target.w) / 2; target.y = (vh - target.h) / 2;
+      drawTarget();
+    }
+
+    function drawTarget() {
+      var c = overlay, ctx = c.getContext('2d');
+      c.width = video.videoWidth; c.height = video.videoHeight;
+      ctx.clearRect(0, 0, c.width, c.height);
+      ctx.strokeStyle = '#ffb020';
+      ctx.lineWidth = Math.max(2, c.width / 200);
+      ctx.setLineDash([10, 8]);
+      ctx.strokeRect(target.x, target.y, target.w, target.h);
+    }
+
+    var lumCanvas = document.createElement('canvas');
+    var lumCtx = lumCanvas.getContext('2d', { willReadFrequently: true });
+
+    function onVideoFrame(now, metadata) {
+      if (!running || !video.videoWidth) { scheduleNext(metadata); return; }
+      var vw = video.videoWidth, vh = video.videoHeight;
+      if (target.w === 0) computeTarget();
+
+      // Downscale the target region to ~32x32 and read luminance in one pass.
+      var s = 32;
+      lumCanvas.width = s; lumCanvas.height = s;
+      lumCtx.drawImage(video, target.x, target.y, target.w, target.h, 0, 0, s, s);
+      var d = lumCtx.getImageData(0, 0, s, s).data;
+      var sum = 0;
+      for (var i = 0; i < d.length; i += 4) sum += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+      var lum = sum / (s * s);
+
+      lumBar.style.width = Math.min(100, lum / 2.55) + '%';
+      lumValue.textContent = 'luminance: ' + lum.toFixed(0);
+
+      if (lum > 60) camBox.classList.add('target-ready');
+      else camBox.classList.remove('target-ready');
+
+      detectFlashEdge(lum, metadata.expectedDisplayTime || now);
+      scheduleNext(metadata);
+    }
+
+    function scheduleNext(metadata) {
+      if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+        video.requestVideoFrameCallback(onVideoFrame);
+      } else {
+        setTimeout(function () { onVideoFrame(performance.now(), { expectedDisplayTime: performance.now() }); }, 1000 / 60);
+      }
+    }
+
+    // ================= PAIRING / STATS =================
+    var prevLum = 0;
+    function detectFlashEdge(lum, camTs) {
+      var rising = lum - prevLum > LUM_JUMP;
+      prevLum = lum;
+      if (!rising) return;
+      var now = performance.now();
+      if (now < quietUntil) return;
+      // Luminance is sampled per camera frame; the actual flash happened
+      // sometime during that frame interval. Use the midpoint of the rise.
+      if (now - lastFlashAt < FLASH_DEBOUNCE) return;
+      lastFlashAt = now;
+
+      // Find the most recent click within PAIR_WINDOW.
+      var clickIdx = -1;
+      for (var i = clickEvents.length - 1; i >= 0; i--) {
+        var dt = now - clickEvents[i].t;
+        if (dt <= PAIR_WINDOW) { clickIdx = i; break; }
+        if (dt > PAIR_WINDOW * 2) break;
+      }
+      if (clickIdx === -1) return;
+
+      var click = clickEvents[clickIdx];
+      // Discard clicks that were already paired (prevents one click -> two flashes).
+      if (click.paired) return;
+      click.paired = true;
+
+      var latency = now - click.t;
+      if (micOffsetMs != null) latency -= micOffsetMs;
+      pairs.push(latency);
+      renderPair(pairs.length, latency);
+      updateStats();
+      clickEvents = clickEvents.filter(function (e) { return !e.paired; });
+
+      // Briefly ignore further events after a successful pair (double-click / echo).
+      quietUntil = now + QUIET_AFTER_PAIR;
+    }
+
+    function renderPair(n, ms) {
+      pairsSection.hidden = false;
+      var tr = document.createElement('tr');
+      tr.innerHTML = '<td>' + n + '</td><td>' + ms.toFixed(1) + '</td>';
+      pairsBody.appendChild(tr);
+    }
+
+    function median(arr) {
+      var a = arr.slice().sort(function (x, y) { return x - y; });
+      var mid = a.length >> 1;
+      return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
+    }
+
+    function updateStats() {
+      if (!pairs.length) return;
+      var med = median(pairs);
+      var deviations = pairs.map(function (v) { return Math.abs(v - med); });
+      var mad = median(deviations);
+      // Uncertainty: half a camera frame (assume ~60 fps worst case 8ms) + spread
+      var unc = Math.max(4, 8 + mad);
+      resMedian.textContent = med.toFixed(0);
+      resUnc.textContent = '± ' + unc.toFixed(0);
+      resPairs.textContent = pairs.length;
+
+      var v;
+      if (med < 30) v = 'Esports-class ⚡';
+      else if (med < 50) v = 'Competitive ✅';
+      else if (med < 80) v = 'Typical desktop 👍';
+      else v = 'Noticeable lag — check refresh rate, resolution and background load.';
+      verdictEl.textContent = v + (micOffsetMs == null ? ' (uncorrected — run mic calibration for better accuracy)' : '');
+    }
+
+    function resetAll() {
+      pairs = [];
+      clickEvents = [];
+      pairsBody.innerHTML = '';
+      pairsSection.hidden = true;
+      resMedian.textContent = '—';
+      resUnc.textContent = '—';
+      resPairs.textContent = '0';
+      verdictEl.textContent = '';
+      resetBtn.disabled = true;
+      setStatus('Reset. Click the mouse ~1× per second to keep measuring.', 'ok');
+    }
+
+    // ================= BOOT =================
+    async function start() {
+      startBtn.disabled = true;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'environment', width: { ideal: 1280 }, frameRate: { ideal: 60 } },
+          audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+        });
+      } catch (err) {
+        setStatus('Camera/mic access failed: ' + err.message, 'err');
+        startBtn.disabled = false;
+        return;
+      }
+      video.srcObject = stream;
+      await video.play();
+      computeTarget();
+
+      await initAudio();
+      if (audioCtx && audioCtx.state === 'suspended') await audioCtx.resume();
+
+      running = true;
+      calBtn.disabled = false;
+      resetBtn.disabled = false;
+      targetGuide.classList.add('hidden');
+      setStatus('Measuring. Click the mouse ~1× per second, keeping the flashes inside the box.', 'ok');
+      scheduleNext(null);
+    }
+
+    startBtn.addEventListener('click', start);
+    calBtn.addEventListener('click', calibrate);
+    resetBtn.addEventListener('click', resetAll);
+
+    // Prevent the screen from sleeping while measuring.
+    if ('wakeLock' in navigator) {
+      var wakeLock = null;
+      document.addEventListener('visibilitychange', async function () {
+        if (document.visibilityState === 'visible' && running) {
+          try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+        }
+      });
+    }
+  })();
+  </script>
+</body>
+</html>

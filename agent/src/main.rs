@@ -7,6 +7,7 @@
 // ESC quits. `--tearing` switches to SyncInterval 0 + ALLOW_TEARING.
 
 #![cfg(windows)]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 #![allow(non_snake_case)]
 
 use std::fs::{File, OpenOptions};
@@ -21,10 +22,11 @@ use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Texture2D,
-    ID3D11VertexShader, ID3D11PixelShader, ID3D11Resource,
+    ID3D11VertexShader, ID3D11PixelShader, ID3D11Resource, ID3D11RasterizerState,
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG,
-    D3D11_CREATE_DEVICE_SINGLETHREADED, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    D3D11_USAGE_STAGING, D3D11CreateDeviceAndSwapChain,
+    D3D11_CREATE_DEVICE_SINGLETHREADED, D3D11_CULL_NONE, D3D11_FILL_SOLID, D3D11_RASTERIZER_DESC,
+    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11_USAGE_STAGING, D3D11_VIEWPORT, D3D11CreateDeviceAndSwapChain,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_MODE_DESC, DXGI_MODE_SCALING_UNSPECIFIED,
@@ -46,10 +48,11 @@ use windows::Win32::UI::Input::{
     RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEMOUSE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetSystemMetrics, PeekMessageW,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetSystemMetrics, MessageBoxW, PeekMessageW,
     PostQuitMessage, RegisterClassW, ShowCursor, TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG,
-    PM_REMOVE, RI_MOUSE_LEFT_BUTTON_DOWN, SM_CXSCREEN, SM_CYSCREEN, WINDOW_EX_STYLE, WM_DESTROY,
-    WM_INPUT, WM_KEYDOWN, WM_QUIT, WNDCLASSW, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+    MB_ICONERROR, PM_REMOVE, RI_MOUSE_LEFT_BUTTON_DOWN, SM_CXSCREEN, SM_CYSCREEN,
+    WINDOW_EX_STYLE, WM_DESTROY, WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_QUIT, WNDCLASSW,
+    WS_POPUP, WS_SYSMENU, WS_VISIBLE,
 };
 
 // ---------------------------------------------------------------------------
@@ -147,15 +150,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 // ulButtons lives in the RAWMOUSE_0 union.
                 let buttons = mouse.Anonymous.ulButtons;
                 if buttons & RI_MOUSE_LEFT_BUTTON_DOWN != 0 {
-                    let last = LAST_CLICK_QPC.swap(now, Ordering::Relaxed);
-                    let debounce = CLICK_DEBOUNCE_MS * qpc_freq() / 1000;
-                    if last == 0 || now - last >= debounce {
-                        let seq = CLICK_COUNT.fetch_add(1, Ordering::Relaxed);
-                        CLICK_PENDING.store(true, Ordering::Release);
-                        log_click(now, seq);
-                    }
+                    register_click(now);
                 }
             }
+            LRESULT(0)
+        }
+        // Safety net: also accept the translated message path in case raw
+        // input is unavailable. Debounce dedupes against WM_INPUT.
+        WM_LBUTTONDOWN => {
+            register_click(qpc());
             LRESULT(0)
         }
         WM_KEYDOWN if wparam.0 as u32 == VK_ESCAPE.0 as u32 => {
@@ -168,6 +171,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+fn register_click(now: u64) {
+    let last = LAST_CLICK_QPC.swap(now, Ordering::Relaxed);
+    let debounce = CLICK_DEBOUNCE_MS * qpc_freq() / 1000;
+    if last == 0 || now - last >= debounce {
+        let seq = CLICK_COUNT.fetch_add(1, Ordering::Relaxed);
+        CLICK_PENDING.store(true, Ordering::Release);
+        log_click(now, seq);
     }
 }
 
@@ -316,6 +329,34 @@ unsafe fn create_renderer(hwnd: HWND, width: u32, height: u32, allow_tearing: bo
     context.PSSetShader(&ps, None);
     context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
 
+    // Rasterizer: cull none so the fullscreen triangle always draws.
+    let rs_desc = D3D11_RASTERIZER_DESC {
+        FillMode: D3D11_FILL_SOLID,
+        CullMode: D3D11_CULL_NONE,
+        FrontCounterClockwise: false.into(),
+        DepthBias: 0,
+        DepthBiasClamp: 0.0,
+        SlopeScaledDepthBias: 0.0,
+        DepthClipEnable: true.into(),
+        ScissorEnable: false.into(),
+        MultisampleEnable: false.into(),
+        AntialiasedLineEnable: false.into(),
+    };
+    let mut rs: Option<ID3D11RasterizerState> = None;
+    device.CreateRasterizerState(&rs_desc, Some(&mut rs))?;
+    context.RSSetState(&rs.unwrap());
+
+    // Viewport: without this, nothing renders (D3D11 default is empty).
+    let vp = D3D11_VIEWPORT {
+        TopLeftX: 0.0,
+        TopLeftY: 0.0,
+        Width: width as f32,
+        Height: height as f32,
+        MinDepth: 0.0,
+        MaxDepth: 1.0,
+    };
+    context.RSSetViewports(Some(&[vp]));
+
     // Staging texture for later self-checks (§7 adjacency test); unused for now.
     let tex_desc = D3D11_TEXTURE2D_DESC {
         Width: width,
@@ -338,6 +379,10 @@ unsafe fn create_renderer(hwnd: HWND, width: u32, height: u32, allow_tearing: bo
 
 impl Renderer {
     unsafe fn render_frame(&self, flash_active: bool, gray_code: u32, vsync: bool) -> windows::core::Result<()> {
+        // Explicit black clear — never present an uninitialized backbuffer.
+        let clear = [0.0f32, 0.0, 0.0, 1.0];
+        self.context.ClearRenderTargetView(&self.rtv, &clear);
+
         let cb_data = FrameCb { flash_active: flash_active as u32, gray_code, _pad: [0; 2] };
         let cb_res: ID3D11Resource = self.cb.cast()?;
         self.context.UpdateSubresource(&cb_res, 0, None, &cb_data as *const _ as *const core::ffi::c_void, 0, 0);
@@ -425,7 +470,18 @@ fn gray(v: u32) -> u32 {
 }
 
 fn main() {
-    unsafe { run() }.unwrap_or_else(|e| eprintln!("fatal: {e}"));
+    if let Err(e) = unsafe { run() } {
+        let msg = format!("latency-agent fatal error:\n{e}");
+        let wide: Vec<u16> = msg.encode_utf16().chain([0]).collect();
+        unsafe {
+            let _ = MessageBoxW(
+                None,
+                windows::core::PCWSTR(wide.as_ptr()),
+                windows::core::w!("latency-agent"),
+                MB_ICONERROR,
+            );
+        }
+    }
 }
 
 unsafe fn run() -> windows::core::Result<()> {

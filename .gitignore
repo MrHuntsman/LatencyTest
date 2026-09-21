@@ -1,0 +1,15 @@
+# Rust agent
+agent/target/
+
+# Android / Gradle
+sensor/.gradle/
+sensor/build/
+sensor/app/build/
+sensor/local.properties
+sensor/.idea/
+*.iml
+
+# Local run artifacts
+*.csv
+*.apk
+.idea/

@@ -362,6 +362,14 @@
       setStatus('Reset. Click the mouse ~1× per second to keep measuring.', 'ok');
     }
 
+    // Test/debug hook (used by automated smoke tests; harmless otherwise).
+    window.__sensorDebug = {
+      get clickEvents() { return clickEvents; },
+      get pairs() { return pairs; },
+      injectClick: function (t) { clickEvents.push({ t: t == null ? performance.now() : t, rms: 0.5 }); },
+      detectFlashEdge: detectFlashEdge
+    };
+
     // ================= BOOT =================
     async function start() {
       startBtn.disabled = true;

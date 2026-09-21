@@ -1,0 +1,20 @@
+{
+  "name": "latency-test",
+  "version": "1.0.0",
+  "description": "Click-to-photon system latency test",
+  "scripts": {
+    "test": "node test/smoke.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MrHuntsman/LatencyTest.git"
+  },
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/MrHuntsman/LatencyTest/issues"
+  },
+  "homepage": "https://github.com/MrHuntsman/LatencyTest#readme",
+  "devDependencies": {
+    "puppeteer-core": "^25.11.0"
+  }
+}

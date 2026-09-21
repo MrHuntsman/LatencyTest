@@ -160,6 +160,10 @@
       'registerProcessor("onset-detector", OnsetDetector);'
     ].join('\n');
 
+    function sleep(ms) {
+      return new Promise(function (r) { setTimeout(r, ms); });
+    }
+
     // Map an AudioContext timestamp to the performance.now() timebase.
     function audioTimeToPerf(audioTime) {
       return performance.now() - (audioCtx.currentTime - audioTime) * 1000;

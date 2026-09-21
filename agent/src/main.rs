@@ -23,10 +23,9 @@ use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Texture2D,
     ID3D11VertexShader, ID3D11PixelShader, ID3D11Resource, ID3D11RasterizerState,
-    D3D11_BIND_CONSTANT_BUFFER, D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG,
+    D3D11_BIND_CONSTANT_BUFFER, D3D11_BUFFER_DESC, D3D11_CREATE_DEVICE_FLAG,
     D3D11_CREATE_DEVICE_SINGLETHREADED, D3D11_CULL_NONE, D3D11_FILL_SOLID, D3D11_RASTERIZER_DESC,
-    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    D3D11_USAGE_STAGING, D3D11_VIEWPORT, D3D11CreateDeviceAndSwapChain,
+    D3D11_SDK_VERSION, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT, D3D11CreateDeviceAndSwapChain,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_MODE_DESC, DXGI_MODE_SCALING_UNSPECIFIED,
@@ -49,10 +48,10 @@ use windows::Win32::UI::Input::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetSystemMetrics, MessageBoxW, PeekMessageW,
-    PostQuitMessage, RegisterClassW, ShowCursor, TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG,
-    MB_ICONERROR, PM_REMOVE, RI_MOUSE_LEFT_BUTTON_DOWN, SM_CXSCREEN, SM_CYSCREEN,
-    WINDOW_EX_STYLE, WM_DESTROY, WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_QUIT, WNDCLASSW,
-    WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+    PostQuitMessage, RegisterClassW, SetWindowTextW, ShowCursor, TranslateMessage, CS_HREDRAW,
+    CS_VREDRAW, MSG, MB_ICONERROR, PM_REMOVE, RI_MOUSE_LEFT_BUTTON_DOWN, SM_CXSCREEN,
+    SM_CYSCREEN, WINDOW_EX_STYLE, WM_DESTROY, WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_QUIT,
+    WNDCLASSW, WS_CAPTION, WS_OVERLAPPED, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
 };
 
 // ---------------------------------------------------------------------------
@@ -206,15 +205,10 @@ struct FrameCb {
 }
 
 struct Renderer {
-    #[allow(dead_code)] // needed for §7 adjacency self-check later
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     swap_chain: IDXGISwapChain,
-    #[allow(dead_code)]
-    rtv: ID3D11RenderTargetView,
     cb: ID3D11Buffer,
-    #[allow(dead_code)]
-    staging: Option<ID3D11Texture2D>,
     tearing: bool,
 }
 
@@ -267,11 +261,9 @@ unsafe fn create_renderer(hwnd: HWND, width: u32, height: u32, allow_tearing: bo
     let context = context.unwrap();
     let swap_chain = swap_chain.unwrap();
 
-    let tex: ID3D11Texture2D = swap_chain.GetBuffer(0)?;
-    let resource: ID3D11Resource = tex.cast()?;
-    let mut rtv: Option<ID3D11RenderTargetView> = None;
-    device.CreateRenderTargetView(&resource, None, Some(&mut rtv))?;
-    let rtv = rtv.unwrap();
+    // NOTE: no render-target view is cached here on purpose. A flip-model
+    // swapchain rotates its buffers on every Present, so the RTV must be
+    // re-created from GetBuffer(0) each frame (see render_frame).
 
     let cb_desc = D3D11_BUFFER_DESC {
         ByteWidth: std::mem::size_of::<FrameCb>() as u32,
@@ -327,7 +319,6 @@ unsafe fn create_renderer(hwnd: HWND, width: u32, height: u32, allow_tearing: bo
 
     context.VSSetShader(&vs, None);
     context.PSSetShader(&ps, None);
-    context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
 
     // Rasterizer: cull none so the fullscreen triangle always draws.
     let rs_desc = D3D11_RASTERIZER_DESC {
@@ -357,31 +348,24 @@ unsafe fn create_renderer(hwnd: HWND, width: u32, height: u32, allow_tearing: bo
     };
     context.RSSetViewports(Some(&[vp]));
 
-    // Staging texture for later self-checks (§7 adjacency test); unused for now.
-    let tex_desc = D3D11_TEXTURE2D_DESC {
-        Width: width,
-        Height: height,
-        MipLevels: 1,
-        ArraySize: 1,
-        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-        Usage: D3D11_USAGE_STAGING,
-        BindFlags: 0,
-        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-        MiscFlags: 0,
-    };
-    let mut staging = None;
-    device.CreateTexture2D(&tex_desc, None, Some(&mut staging))?;
-    let staging = staging;
-
-    Ok(Renderer { device, context, swap_chain, rtv, cb, staging, tearing: allow_tearing })
+    Ok(Renderer { device, context, swap_chain, cb, tearing: allow_tearing })
 }
 
 impl Renderer {
     unsafe fn render_frame(&self, flash_active: bool, gray_code: u32, vsync: bool) -> windows::core::Result<()> {
+        // Re-acquire the current back buffer: with DXGI_SWAP_EFFECT_FLIP_DISCARD
+        // the buffer index rotates after every Present, so a cached RTV would
+        // point at the buffer that is currently on screen.
+        let back_buffer: ID3D11Texture2D = self.swap_chain.GetBuffer(0)?;
+        let resource: ID3D11Resource = back_buffer.cast()?;
+        let mut rtv: Option<ID3D11RenderTargetView> = None;
+        self.device.CreateRenderTargetView(&resource, None, Some(&mut rtv))?;
+        let rtv = rtv.unwrap();
+        self.context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+
         // Explicit black clear — never present an uninitialized backbuffer.
         let clear = [0.0f32, 0.0, 0.0, 1.0];
-        self.context.ClearRenderTargetView(&self.rtv, &clear);
+        self.context.ClearRenderTargetView(&rtv, &clear);
 
         let cb_data = FrameCb { flash_active: flash_active as u32, gray_code, _pad: [0; 2] };
         let cb_res: ID3D11Resource = self.cb.cast()?;
@@ -404,7 +388,7 @@ impl Renderer {
 // ---------------------------------------------------------------------------
 // Window + raw input setup
 
-unsafe fn create_window(w: i32, h: i32) -> windows::core::Result<HWND> {
+unsafe fn create_window(w: i32, h: i32, fullscreen: bool) -> windows::core::Result<HWND> {
     let hinstance: HMODULE = GetModuleHandleW(None)?;
     let class_name = PCWSTR::from_raw(windows::core::w!("LatencyAgentClass").as_ptr());
 
@@ -422,21 +406,38 @@ unsafe fn create_window(w: i32, h: i32) -> windows::core::Result<HWND> {
     };
     RegisterClassW(&wc);
 
+    let (style, x, y, cw, ch) = if fullscreen {
+        (WS_POPUP | WS_VISIBLE | WS_SYSMENU, 0, 0, w, h)
+    } else {
+        // Windowed debug mode: 1280x720, centred.
+        let cw = 1280.min(w - 80);
+        let ch = 720.min(h - 120);
+        (
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+            (w - cw) / 2,
+            (h - ch) / 2,
+            cw,
+            ch,
+        )
+    };
+
     let hwnd = CreateWindowExW(
         WINDOW_EX_STYLE::default(),
         class_name,
         windows::core::w!("latency-agent"),
-        WS_POPUP | WS_VISIBLE | WS_SYSMENU,
-        0,
-        0,
-        w,
-        h,
+        style,
+        x,
+        y,
+        cw,
+        ch,
         None,
         None,
         HINSTANCE(hinstance.0),
         None,
     )?;
-    ShowCursor(false);
+    if fullscreen {
+        ShowCursor(false);
+    }
     Ok(hwnd)
 }
 
@@ -487,6 +488,7 @@ fn main() {
 unsafe fn run() -> windows::core::Result<()> {
     let freq = qpc_freq();
     let tearing = std::env::args().any(|a| a == "--tearing");
+    let fullscreen = std::env::args().any(|a| a == "--fullscreen");
     let vsync = !tearing;
 
     let (clicks, frames) = open_logs();
@@ -497,7 +499,7 @@ unsafe fn run() -> windows::core::Result<()> {
 
     let w = GetSystemMetrics(SM_CXSCREEN);
     let h = GetSystemMetrics(SM_CYSCREEN);
-    let hwnd = create_window(w, h)?;
+    let hwnd = create_window(w, h, fullscreen)?;
     register_raw_input(hwnd)?;
 
     let renderer = create_renderer(hwnd, w as u32, h as u32, tearing)?;
@@ -510,7 +512,11 @@ unsafe fn run() -> windows::core::Result<()> {
 
     let _factory: IDXGIFactory1 = CreateDXGIFactory1()?;
 
-    println!("latency-agent: {}x{}, tearing={tearing}, vsync={vsync}", w, h);
+    println!(
+        "latency-agent: screen {}x{}, mode={}, tearing={tearing}, vsync={vsync}",
+        w, h,
+        if fullscreen { "fullscreen" } else { "windowed" }
+    );
     println!("clicks.csv / frames.csv written to cwd. ESC to quit.");
 
     let mut present_index: u32 = 0;
@@ -549,9 +555,25 @@ unsafe fn run() -> windows::core::Result<()> {
             flash_frames_left -= 1;
         }
         present_index = present_index.wrapping_add(1);
+
+        // Live status in the title bar: proof that clicks and frames flow,
+        // even when the flash rect is hard to see during bring-up.
+        if present_index % 15 == 0 {
+            let title = format!(
+                "latency-agent [{}]  clicks={}  frame={}{}",
+                if fullscreen { "fullscreen" } else { "windowed" },
+                CLICK_COUNT.load(Ordering::Relaxed),
+                present_index,
+                if flash_active { "  FLASH" } else { "" },
+            );
+            let wide: Vec<u16> = title.encode_utf16().chain([0]).collect();
+            let _ = SetWindowTextW(hwnd, PCWSTR(wide.as_ptr()));
+        }
     }
 
-    ShowCursor(true);
+    if fullscreen {
+        ShowCursor(true);
+    }
     println!("done. {} clicks logged, {} frames logged.", CLICK_COUNT.load(Ordering::Relaxed), present_index);
     Ok(())
 }

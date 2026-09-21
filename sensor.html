@@ -111,8 +111,11 @@
         await audioCtx.audioWorklet.addModule(url);
         workletNode = new AudioWorkletNode(audioCtx, 'onset-detector');
         workletNode.port.onmessage = function (e) {
-          if (e.data.type === 'click' && running) {
-            clickEvents.push({ t: performance.now(), rms: e.data.rms });
+          if (e.data.type === 'click') {
+            // The worklet stamps AudioContext time; convert to performance.now()
+            // so clicks are comparable with frame timestamps.
+            var tPerf = audioTimeToPerf(e.data.t);
+            clickEvents.push({ t: tPerf, rms: e.data.rms });
             if (clickEvents.length > 40) clickEvents.shift();
             audioMeterEl.textContent = 'mic: click! (' + e.data.rms.toFixed(3) + ')';
           } else if (e.data.type === 'level') {
@@ -157,14 +160,21 @@
       'registerProcessor("onset-detector", OnsetDetector);'
     ].join('\n');
 
+    // Map an AudioContext timestamp to the performance.now() timebase.
+    function audioTimeToPerf(audioTime) {
+      return performance.now() - (audioCtx.currentTime - audioTime) * 1000;
+    }
+
     async function calibrate() {
       if (!audioCtx) return;
       setStatus('Calibrating: 3 beeps. Keep the room quiet…', 'warn');
       calBtn.disabled = true;
       var samples = [];
       for (var i = 0; i < 3; i++) {
-        var t0 = await playBeep();
-        var heard = await waitForClick(1500);
+        // Arm the listener BEFORE playing the beep so its onset can't be missed.
+        var armLen = clickEvents.length;
+        var t0 = playBeep();
+        var heard = await waitForClick(armLen, 1500);
         if (heard == null) {
           setStatus('Calibration failed — beep not heard. Raise the volume and retry.', 'err');
           calBtn.disabled = false;
@@ -178,32 +188,36 @@
       calBtn.disabled = false;
     }
 
+    // Fire-and-forget beep; returns its start in performance.now() terms.
     function playBeep() {
-      return new Promise(function (resolve) {
-        oscGain = audioCtx.createGain();
-        oscGain.gain.value = 0.25;
-        oscGain.connect(audioCtx.destination);
-        var osc = audioCtx.createOscillator();
-        osc.frequency.value = 880;
-        osc.connect(oscGain);
-        var t0 = audioCtx.currentTime;
-        osc.start(t0);
-        osc.stop(t0 + CAL_BEEP_MS / 1000);
-        oscGain.gain.setValueAtTime(0.25, t0 + CAL_BEEP_MS / 1000 - 0.02);
-        oscGain.gain.linearRampToValueAtTime(0, t0 + CAL_BEEP_MS / 1000);
-        setTimeout(function () { resolve(performance.now()); }, CAL_BEEP_MS + 30);
-        oscGain = null;
-      });
+      var g = audioCtx.createGain();
+      g.gain.value = 0.25;
+      g.connect(audioCtx.destination);
+      var osc = audioCtx.createOscillator();
+      osc.frequency.value = 880;
+      osc.connect(g);
+      var t0 = audioCtx.currentTime;
+      osc.start(t0);
+      var end = t0 + CAL_BEEP_MS / 1000;
+      g.gain.setValueAtTime(0.25, end - 0.02);
+      g.gain.linearRampToValueAtTime(0, end);
+      osc.stop(end);
+      osc.onended = function () { g.disconnect(); };
+      return audioTimeToPerf(t0);
     }
 
-    function waitForClick(timeoutMs) {
+    // Resolve with the performance.now() timestamp of the first click detected
+    // after startLen entries were in the buffer; null on timeout.
+    function waitForClick(startLen, timeoutMs) {
       return new Promise(function (resolve) {
-        var startLen = clickEvents.length;
         var t0 = performance.now();
         (function poll() {
-          if (clickEvents.length > startLen) return resolve(clickEvents[clickEvents.length - 1].t);
+          if (clickEvents.length > startLen) {
+            // use the oldest unpaired click since we armed
+            return resolve(clickEvents[startLen].t);
+          }
           if (performance.now() - t0 > timeoutMs) return resolve(null);
-          setTimeout(poll, 20);
+          setTimeout(poll, 10);
         })();
       });
     }
